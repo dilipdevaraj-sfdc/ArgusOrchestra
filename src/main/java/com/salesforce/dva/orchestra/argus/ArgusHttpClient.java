@@ -31,6 +31,7 @@
 package com.salesforce.dva.orchestra.argus;
 
 import com.fasterxml.jackson.annotation.JsonAutoDetect.Visibility;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -38,17 +39,20 @@ import com.salesforce.dva.orchestra.OrchestraException;
 import com.salesforce.dva.orchestra.argus.entity.Annotation;
 import com.salesforce.dva.orchestra.argus.entity.Credentials;
 import com.salesforce.dva.orchestra.argus.entity.Metric;
+import com.salesforce.dva.orchestra.util.Configuration;
+
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpHeaders;
 import org.apache.http.HttpHost;
 import org.apache.http.HttpResponse;
+import org.apache.http.HttpStatus;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.HttpDelete;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpPut;
-import org.apache.http.client.protocol.ClientContext;
 import org.apache.http.conn.routing.HttpRoute;
 import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.BasicCookieStore;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
@@ -56,14 +60,16 @@ import org.apache.http.protocol.BasicHttpContext;
 import org.apache.http.util.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static com.salesforce.dva.orchestra.util.Assert.requireArgument;
-import java.io.UnsupportedEncodingException;
-import java.util.logging.Level;
 
 /**
  * HTTP based API client for Argus.
@@ -79,7 +85,6 @@ public class ArgusHttpClient {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Logger LOGGER = LoggerFactory.getLogger(ArgusHttpClient.class);
-    private static final int CHUNK_SIZE = 50;
     private static final String EXPRESSION_ARG = "expression";
 
     static {
@@ -96,8 +101,10 @@ public class ArgusHttpClient {
     String endpoint;
     CloseableHttpClient httpClient;
     PoolingHttpClientConnectionManager connMgr;
-    private BasicCookieStore cookieStore;
+    //private BasicCookieStore cookieStore;
     private BasicHttpContext httpContext;
+    private String accessToken = null;
+	private String refreshToken = null;
 
     //~ Constructors *********************************************************************************************************************************
 
@@ -137,9 +144,9 @@ public class ArgusHttpClient {
 
             connMgr.setMaxPerRoute(new HttpRoute(host), maxConn / 2);
             httpClient = HttpClients.custom().setConnectionManager(connMgr).setDefaultRequestConfig(defaultRequestConfig).build();
-            cookieStore = new BasicCookieStore();
+            //cookieStore = new BasicCookieStore();
             httpContext = new BasicHttpContext();
-            httpContext.setAttribute(ClientContext.COOKIE_STORE, cookieStore);
+            //httpContext.setAttribute(ClientContext.COOKIE_STORE, cookieStore);
         } catch (MalformedURLException ex) {
             throw new OrchestraException("Error initializing the Argus HTTP Client.", ex);
         }
@@ -163,7 +170,7 @@ public class ArgusHttpClient {
     }
 
     void login(String username, String password) {
-        String requestUrl = endpoint + "/auth/login";
+        String requestUrl = endpoint + "/v2/auth/login";
         Credentials creds = new Credentials();
 
         creds.setPassword(password);
@@ -173,22 +180,57 @@ public class ArgusHttpClient {
 
         try {
             StringEntity entity = new StringEntity(toJson(creds));
-
             response = executeHttpRequest(RequestType.POST, requestUrl, entity);
-            EntityUtils.consume(response.getEntity());
+            
+            int status = response.getStatusLine().getStatusCode();
+			if(status == HttpStatus.SC_OK) {
+				Map<String, String> tokenMap = MAPPER.readValue(extractStringResponse(response), new TypeReference<Map<String, String>>() {});
+				accessToken = tokenMap.get("accessToken");
+				refreshToken = tokenMap.get("refreshToken");
+			} else {
+				throw new OrchestraException("Failed to log in to Argus. Server responded with status code: " + status + 
+						". Reason: " + response.getStatusLine().getReasonPhrase());
+			}
+			
         } catch (IOException | RuntimeException ex) {
             throw new OrchestraException(ex);
         }
 
-        int statusCode = response.getStatusLine().getStatusCode();
-
-        if (statusCode != 200) {
-            String message = statusCode + ": " + response.getStatusLine().getReasonPhrase();
-
-            throw new OrchestraException(message);
-        }
+        
         LOGGER.info("Logged in as " + username);
     }
+    
+    private void refresh() throws RefreshTokenExpiredException {
+		String requestUrl = endpoint + "/v2/auth/token/refresh";
+		
+		HttpResponse response = null;
+		
+		try {
+			Map<String, String> map = new HashMap<>();
+			map.put("refreshToken", refreshToken);
+			StringEntity entity = new StringEntity(toJson(map));
+			
+			response = executeHttpRequest(RequestType.POST, requestUrl, entity);
+			
+			int status = response.getStatusLine().getStatusCode();
+			if(status == HttpStatus.SC_OK) {
+				Map<String, String> tokenMap = MAPPER.readValue(extractStringResponse(response), new TypeReference<Map<String, String>>() {});
+				accessToken = tokenMap.get("accessToken");
+				LOGGER.info("Successfully obtained new access Token.");
+			} else if(status == HttpStatus.SC_UNAUTHORIZED) {
+				String message = "Looks like refresh token has expired. Server responded with status code: " + status + 
+						". Reason: " + response.getStatusLine().getReasonPhrase();
+				LOGGER.warn(message);
+				throw new RefreshTokenExpiredException(message);
+			} else {
+				throw new OrchestraException("Failed to obtain new access token. Server responded with status code: " + status + 
+						". Reason: " + response.getStatusLine().getReasonPhrase());
+			}
+		} catch (IOException ex) {
+			LOGGER.warn("IOException while trying to log in to Argus.", ex);
+			throw new OrchestraException("IO Exception occured while executing HTTP request: ", ex);
+		}
+	}
 
     void logout() {
         String requestUrl = endpoint + "/auth/logout";
@@ -300,32 +342,47 @@ public class ArgusHttpClient {
             case POST:
 
                 HttpPost post = new HttpPost(url);
-
+                post.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
                 post.setEntity(entity);
                 httpResponse = httpClient.execute(post, httpContext);
                 break;
             case GET:
 
                 HttpGet httpGet = new HttpGet(url);
-
+                httpGet.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
                 httpResponse = httpClient.execute(httpGet, httpContext);
                 break;
             case DELETE:
 
                 HttpDelete httpDelete = new HttpDelete(url);
-
+                httpDelete.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
                 httpResponse = httpClient.execute(httpDelete, httpContext);
                 break;
             case PUT:
 
                 HttpPut httpput = new HttpPut(url);
-
+                httpput.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
                 httpput.setEntity(entity);
                 httpResponse = httpClient.execute(httpput, httpContext);
                 break;
             default:
                 throw new IllegalArgumentException(" Request Type " + requestType + " not a valid request type. ");
         }
+        
+        
+		if(!url.contains("auth") && httpResponse.getStatusLine().getStatusCode() == HttpStatus.SC_UNAUTHORIZED) {
+			LOGGER.warn("Looks like access token has expired. Will try to obtain a new access token using refresh token.");
+			try {
+				refresh();
+			} catch(RefreshTokenExpiredException e) {
+				login(Configuration.getParameter(Configuration.Parameter.ARGUSWS_USERNAME), 
+						Configuration.getParameter(Configuration.Parameter.ARGUSWS_PASSWORD));
+			}
+			
+			executeHttpRequest(requestType, url, entity);
+			
+		}
+        
         return httpResponse;
     }
 
@@ -334,6 +391,36 @@ public class ArgusHttpClient {
             return MAPPER.writeValueAsString(type);
         } catch (IOException ex) {
             throw new OrchestraException(ex);
+        }
+    }
+    
+    private String extractStringResponse(HttpResponse content) {
+        requireArgument(content != null, "Response content is null.");
+
+        String result;
+        HttpEntity entity = null;
+
+        try {
+            entity = content.getEntity();
+            if (entity == null) {
+                result = "";
+            } else {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+
+                entity.writeTo(baos);
+                result = baos.toString("UTF-8");
+            }
+            return result;
+        } catch (IOException ex) {
+            throw new OrchestraException(ex);
+        } finally {
+            if (entity != null) {
+                try {
+                    EntityUtils.consume(entity);
+                } catch (IOException ex) {
+                    LOGGER.warn("Failed to close entity stream.", ex);
+                }
+            }
         }
     }
 
@@ -362,9 +449,26 @@ public class ArgusHttpClient {
          *
          * @return  The request type.
          */
-        public String getRequestType() {
+        @SuppressWarnings("unused")
+		public String getRequestType() {
             return requestType;
         }
+    }
+    
+    @SuppressWarnings("serial")
+	class RefreshTokenExpiredException extends Exception {
+    	
+    	public RefreshTokenExpiredException(String msg) {
+    		super(msg);
+    	}
+
+    	public RefreshTokenExpiredException(Throwable cause) {
+    		super(cause);
+    	}
+
+    	public RefreshTokenExpiredException(String msg, Throwable cause) {
+    		super(msg, cause);
+    	}
     }
 }
 /* Copyright (c) 2016, Salesforce.com, Inc.  All rights reserved. */
