@@ -32,12 +32,9 @@ package com.salesforce.dva.orchestra.util;
 
 import org.slf4j.LoggerFactory;
 import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Properties;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
  * Configuration properties for Orchestra. The location of the configuration property file can be specified by using
