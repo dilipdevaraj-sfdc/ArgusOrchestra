@@ -233,7 +233,7 @@ public class ArgusHttpClient {
 	}
 
     void logout() {
-        String requestUrl = endpoint + "/auth/logout";
+        String requestUrl = endpoint + "/v2/auth/logout";
         HttpResponse response = null;
 
         try {
